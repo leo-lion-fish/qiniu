@@ -1,0 +1,25 @@
+# Web框架
+fastapi==0.75.0  # FastAPI框架
+uvicorn==0.17.0  # Uvicorn服务器，用于运行FastAPI
+
+# 数据验证与依赖管理
+pydantic==1.8.2  # Pydantic用于FastAPI的数据验证
+
+# 数据库支持（可选，根据你使用的数据库选择）
+sqlalchemy==1.4.23  # SQLAlchemy ORM，用于与数据库交互
+databases==0.5.4  # 异步数据库库
+psycopg2-binary==2.9.1 # PostgreSQL数据库驱动（如果使用PostgreSQL）
+aiomysql==0.0.21  # MySQL的异步支持（如果使用MySQL）
+
+# Redis支持
+redis==4.0.2  # Redis客户端库
+
+# 工具库（如果需要）
+requests==2.26.0  # 用于与外部API进行HTTP请求
+
+# 异步编程工具
+asyncio==3.4.3  # 异步IO支持
+
+# 性能优化
+gunicorn==20.1.0  # 用于多进程运行FastAPI，部署时可选择
+python-dotenv==0.19.2  # 用于加载环境变量文件（.env）
