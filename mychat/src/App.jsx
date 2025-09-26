@@ -1,41 +1,36 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
 /**
- * Minimal Frontend for your FastAPI backend
- * Features:
- * - Session list / create new (front-end generates UUID)
- * - Character list & bind to session
- * - Chat (history load + SSE streaming via /chat/stream, fallback /chat)
- * - Model selector: curated dropdown from /models + custom text (custom takes priority)
- * - Basic error & loading states; settings (backend URL, fallback default model)
+ * App.jsx — 前端最小成品（多轮会话 / 角色会话级绑定 / 模型选择 / 流式SSE / TTS / 浏览器ASR）
  *
- * Assumptions:
- * - Backend at same host or set in the left-bottom settings (BASE_URL).
- * - Endpoints:
+ * 后端接口（FastAPI）：
  *   GET  /characters
- *   POST /sessions/{sid}/bind-character
- *   GET  /sessions
+ *   GET  /sessions                      -> 建议返回 { session_id, character_id?, character_name? }
  *   GET  /sessions/{sid}/messages
- *   POST /chat
- *   POST /chat/stream
- *   GET  /models   -> { default: "deepseek-v3", models: [{id,label?,recommended?}, ...] }
+ *   POST /sessions/{sid}/bind-character -> { character_id }
+ *   POST /chat                          -> { session_id, message, model? }
+ *   POST /chat/stream                   -> SSE（data:{"content"} | "[DONE]")
+ *   GET  /models                        -> { default, models: [{id,label?,recommended?}] }
+ *   GET  /voice/list                    -> [{ voice_name, voice_type, ... }]
+ *   POST /voice/tts                     -> { audio: "data:audio/mp3;base64,...", duration_ms }
  */
 
 const BASE_URL_DEFAULT =
-  typeof window !== "undefined" ? `${window.location.origin.replace(/\/+$/, "")}` : "http://127.0.0.1:8000";
+  typeof window !== "undefined"
+    ? `${window.location.origin.replace(/\/+$|$/g, "")}`
+    : "http://127.0.0.1:8000";
 
+/* ---------------- utils ---------------- */
 function uuidv4() {
-  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, c => {
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
     const r = (Math.random() * 16) | 0,
       v = c === "x" ? r : (r & 0x3) | 0x8;
     return v.toString(16);
   });
 }
-
-function clsx(...args) {
-  return args.filter(Boolean).join(" ");
+function clsx(...a) {
+  return a.filter(Boolean).join(" ");
 }
-
 function useLocalStorage(key, initialValue) {
   const [state, setState] = useState(() => {
     try {
@@ -53,78 +48,99 @@ function useLocalStorage(key, initialValue) {
   return [state, setState];
 }
 
+/* ======================================================================= */
 export default function App() {
-  // settings
+  /* ---------- Settings ---------- */
   const [baseUrl, setBaseUrl] = useLocalStorage("cfg.baseUrl", BASE_URL_DEFAULT);
-  const [defaultModel, setDefaultModel] = useLocalStorage("cfg.defaultModel", "deepseek-v3");
+  const [defaultModel, setDefaultModel] = useLocalStorage(
+    "cfg.defaultModel",
+    "deepseek-v3"
+  );
 
-  // sessions
+  /* ---------- Sessions ---------- */
   const [sessions, setSessions] = useState([]);
   const [sid, setSid] = useLocalStorage("chat.sid", "");
 
-  // characters
+  /* ---------- Characters ---------- */
   const [chars, setChars] = useState([]);
-  const [bindCharId, setBindCharId] = useLocalStorage("chat.bindCharId", null);
+  // ☆ 关键：当前“会话”的绑定角色，仅用于UI展示（不再用全局 localStorage 记忆）
+  const [currentCharId, setCurrentCharId] = useState(null);
 
-  // curated models & user choice
-  const [models, setModels] = useState([]);                        // [{id,label?,recommended?}]
+  /* ---------- Models (curated + custom) ---------- */
+  const [models, setModels] = useState([]); // [{id,label?,recommended?}]
   const [modelSelect, setModelSelect] = useLocalStorage("cfg.modelSelect", "");
   const [modelCustom, setModelCustom] = useLocalStorage("cfg.modelCustom", "");
 
-  // chat
-  const [messages, setMessages] = useState([]); // [{role, content, created_at?}]
+  /* ---------- Messages ---------- */
+  const [messages, setMessages] = useState([]);
   const [input, setInput] = useLocalStorage("chat.input", "");
   const [sending, setSending] = useState(false);
   const [streaming, setStreaming] = useState(false);
   const [error, setError] = useState("");
 
+  /* ---------- TTS ---------- */
+  const [voices, setVoices] = useState([]); // from /voice/list
+  const [voiceType, setVoiceType] = useLocalStorage(
+    "cfg.voiceType",
+    "qiniu_zh_female_tmjxxy"
+  );
+  const [autoSpeak, setAutoSpeak] = useLocalStorage("cfg.autoSpeak", true);
+  const audioRef = useRef(null);
+
+  /* ---------- ASR (Web Speech API) ---------- */
+  const [recOn, setRecOn] = useState(false);
+  const recognitionRef = useRef(null);
+
+  /* ---------- Refs ---------- */
   const listBottomRef = useRef(null);
   const inputRef = useRef(null);
+  const [showSettings, setShowSettings] = useState(false); // 左侧底部折叠
 
+  /* ---------- API helpers ---------- */
   const api = useMemo(
     () => ({
       async getCharacters() {
-        const res = await fetch(`${baseUrl}/characters`);
-        if (!res.ok) throw new Error(await res.text());
-        return res.json();
+        const r = await fetch(`${baseUrl}/characters`);
+        if (!r.ok) throw new Error(await r.text());
+        return r.json();
       },
       async getSessions() {
-        const res = await fetch(`${baseUrl}/sessions`);
-        if (!res.ok) throw new Error(await res.text());
-        return res.json();
+        const r = await fetch(`${baseUrl}/sessions`);
+        if (!r.ok) throw new Error(await r.text());
+        return r.json();
       },
       async getMessages(sid) {
-        const res = await fetch(`${baseUrl}/sessions/${encodeURIComponent(sid)}/messages`);
-        if (!res.ok) throw new Error(await res.text());
-        return res.json();
+        const r = await fetch(`${baseUrl}/sessions/${encodeURIComponent(sid)}/messages`);
+        if (!r.ok) throw new Error(await r.text());
+        return r.json();
       },
       async bindCharacter(sid, character_id) {
-        const res = await fetch(`${baseUrl}/sessions/${encodeURIComponent(sid)}/bind-character`, {
+        const r = await fetch(`${baseUrl}/sessions/${encodeURIComponent(sid)}/bind-character`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ character_id }),
         });
-        if (!res.ok) throw new Error(await res.text());
-        return res.json();
+        if (!r.ok) throw new Error(await r.text());
+        return r.json();
       },
       async chat(body) {
-        const res = await fetch(`${baseUrl}/chat`, {
+        const r = await fetch(`${baseUrl}/chat`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
         });
-        if (!res.ok) throw new Error(await res.text());
-        return res.json();
+        if (!r.ok) throw new Error(await r.text());
+        return r.json();
       },
       async *chatStream(body) {
-        const res = await fetch(`${baseUrl}/chat/stream`, {
+        const r = await fetch(`${baseUrl}/chat/stream`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
         });
-        if (!res.ok) throw new Error(await res.text());
+        if (!r.ok) throw new Error(await r.text());
 
-        const reader = res.body.getReader();
+        const reader = r.body.getReader();
         const decoder = new TextDecoder("utf-8");
         let buf = "";
         try {
@@ -144,7 +160,7 @@ export default function App() {
                 if (obj.content) yield obj.content;
                 if (obj.error) throw new Error(obj.error);
               } catch {
-                // ignore malformed chunks
+                /* ignore malformed chunk */
               }
             }
           }
@@ -152,17 +168,35 @@ export default function App() {
           reader.releaseLock();
         }
       },
+      async getVoiceList() {
+        const r = await fetch(`${baseUrl}/voice/list`);
+        if (!r.ok) throw new Error(await r.text());
+        return r.json();
+      },
+      async tts(voice_type, text, encoding = "mp3", speed_ratio = 1.0) {
+        const r = await fetch(`${baseUrl}/voice/tts`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ voice_type, text, encoding, speed_ratio }),
+        });
+        if (!r.ok) throw new Error(await r.text());
+        return r.json(); // { audio, duration_ms }
+      },
     }),
     [baseUrl]
   );
 
-  // initial load
+  /* ---------- Initial load ---------- */
   useEffect(() => {
     (async () => {
       try {
-        const [c, s] = await Promise.allSettled([api.getCharacters(), api.getSessions()]);
-        if (c.status === "fulfilled") setChars(c.value || []);
-        if (s.status === "fulfilled") setSessions(s.value || []);
+        setError("");
+        const [cRes, sRes] = await Promise.allSettled([
+          api.getCharacters(),
+          api.getSessions(),
+        ]);
+        if (cRes.status === "fulfilled") setChars(cRes.value || []);
+        if (sRes.status === "fulfilled") setSessions(sRes.value || []);
 
         // curated models
         try {
@@ -174,12 +208,24 @@ export default function App() {
             if (!defaultModel && data.default) setDefaultModel(data.default);
           }
         } catch {
-          // ignore; can still type custom
+          /* optional */
         }
 
-        // ensure a sid
+        // voice list
+        try {
+          const vs = await api.getVoiceList();
+          setVoices(vs || []);
+          if (!voiceType) {
+            const v = (vs || []).find((x) => String(x.voice_type || "").startsWith("qiniu_zh_female")) || vs?.[0];
+            if (v?.voice_type) setVoiceType(v.voice_type);
+          }
+        } catch {
+          /* optional */
+        }
+
+        // ensure sid
         if (!sid) {
-          const first = s.status === "fulfilled" ? s.value?.[0]?.session_id : undefined;
+          const first = sRes.status === "fulfilled" ? sRes.value?.[0]?.session_id : null;
           setSid(first || uuidv4());
         }
       } catch (e) {
@@ -190,7 +236,7 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // when sid changes: load messages; best-effort auto-bind preferred char on empty history
+  /* ---------- Load messages on sid change ---------- */
   useEffect(() => {
     if (!sid) return;
     (async () => {
@@ -198,37 +244,78 @@ export default function App() {
         setError("");
         const msgs = await api.getMessages(sid);
         setMessages(msgs || []);
-        if (bindCharId && (!msgs || msgs.length === 0)) {
-          try {
-            await api.bindCharacter(sid, bindCharId);
-          } catch {}
-        }
       } catch (e) {
         console.error(e);
         setError(String(e));
       }
     })();
-  }, [sid, bindCharId, api]);
+  }, [sid, api]);
 
-  // autoscroll
+  /* ---------- 当会话或会话列表变化时，同步当前会话的角色到下拉框 ---------- */
+  useEffect(() => {
+    if (!sid) return;
+    const cur = sessions.find((s) => s.session_id === sid);
+    // 后端若返回 character_id 则直接用；否则尝试由 character_name 反查
+    if (cur?.character_id != null) {
+      setCurrentCharId(cur.character_id);
+    } else if (cur?.character_name) {
+      const found = chars.find((c) => c.name === cur.character_name);
+      setCurrentCharId(found?.id ?? null);
+    } else {
+      setCurrentCharId(null);
+    }
+  }, [sid, sessions, chars]);
+
+  /* ---------- Autoscroll ---------- */
   useEffect(() => {
     listBottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, streaming]);
 
+  /* ---------- Actions ---------- */
   async function handleCreateSession() {
     const newSid = uuidv4();
     setSid(newSid);
     setMessages([]);
+    setCurrentCharId(null);
   }
 
-  async function handleBindCharacter(id) {
+  async function handleBindCharacter(val) {
     if (!sid) return;
+    // 允许“未绑定”
+    if (val === "" || val === null) {
+      setCurrentCharId(null);
+      // 如需后端“解绑”可在此调用相应接口
+      // await api.unbindCharacter?.(sid)
+      // 同步更新列表里的当前会话显示
+      setSessions((prev) => prev.map((s) => (s.session_id === sid ? { ...s, character_id: null, character_name: undefined } : s)));
+      return;
+    }
+    const idNum = Number(val);
+    if (Number.isNaN(idNum)) return;
     try {
-      await api.bindCharacter(sid, id);
-      setBindCharId(id);
-      // optional UX: small toast could be added
+      await api.bindCharacter(sid, idNum);
+      setCurrentCharId(idNum);
+      const newName = chars.find((c) => c.id === idNum)?.name;
+      setSessions((prev) =>
+        prev.map((s) => (s.session_id === sid ? { ...s, character_id: idNum, character_name: newName ?? s.character_name } : s))
+      );
     } catch (e) {
       setError("绑定角色失败：" + String(e));
+    }
+  }
+
+  async function speakIfNeeded(text) {
+    if (!autoSpeak || !text) return;
+    try {
+      const { audio } = await api.tts(voiceType, text, "mp3", 1.0);
+      if (audioRef.current) {
+        audioRef.current.src = audio;
+        await audioRef.current.play().catch(() => {
+          /* 首次可能需要用户手势 */
+        });
+      }
+    } catch (e) {
+      console.warn("TTS 播放失败：", e);
     }
   }
 
@@ -236,22 +323,35 @@ export default function App() {
     const text = input.trim();
     if (!text || sending || streaming) return;
     setError("");
+    setSending(true);
 
-    // model resolution: custom > dropdown > fallback input > backend default
+    // model resolution: custom > dropdown > fallback > backend default
     const candidate = (modelCustom || "").trim();
     const selected = (modelSelect || "").trim();
     const fallback = (defaultModel || "").trim();
     const finalModel = candidate || selected || fallback || undefined;
 
     // optimistic append user msg
-    const newUser = { role: "user", content: text, created_at: new Date().toISOString() };
-    setMessages(prev => [...prev, newUser]);
+    const newUser = {
+      role: "user",
+      content: text,
+      created_at: new Date().toISOString(),
+    };
+    setMessages((prev) => [...prev, newUser]);
     setInput("");
 
     // streaming path
     setStreaming(true);
     let acc = "";
-    setMessages(prev => [...prev, { role: "assistant", content: "", created_at: new Date().toISOString(), _streaming: true }]);
+    setMessages((prev) => [
+      ...prev,
+      {
+        role: "assistant",
+        content: "",
+        created_at: new Date().toISOString(),
+        _streaming: true,
+      },
+    ]);
 
     try {
       const body = { session_id: sid, message: text };
@@ -261,7 +361,7 @@ export default function App() {
       for await (const chunk of api.chatStream(body)) {
         gotChunk = true;
         acc += chunk;
-        setMessages(prev => {
+        setMessages((prev) => {
           const copy = [...prev];
           for (let i = copy.length - 1; i >= 0; i--) {
             if (copy[i].role === "assistant" && copy[i]._streaming) {
@@ -272,10 +372,11 @@ export default function App() {
           return copy;
         });
       }
+
       if (!gotChunk && acc === "") {
         const r = await api.chat(body);
         acc = r?.reply || "";
-        setMessages(prev => {
+        setMessages((prev) => {
           const copy = [...prev];
           for (let i = copy.length - 1; i >= 0; i--) {
             if (copy[i].role === "assistant" && copy[i]._streaming) {
@@ -286,18 +387,21 @@ export default function App() {
           return copy;
         });
       } else {
-        setMessages(prev => prev.map(m => (m._streaming ? { ...m, _streaming: false } : m)));
+        setMessages((prev) => prev.map((m) => (m._streaming ? { ...m, _streaming: false } : m)));
       }
+
+      // TTS
+      await speakIfNeeded(acc);
     } catch (e) {
       console.error(e);
       setError("发送失败：" + String(e));
-      setMessages(prev => prev.filter(m => !m._streaming));
+      setMessages((prev) => prev.filter((m) => !m._streaming));
     } finally {
       setStreaming(false);
       setSending(false);
       inputRef.current?.focus();
       try {
-        setSessions(await api.getSessions());
+        setSessions(await api.getSessions()); // 刷新会话，带出最新角色名
       } catch {}
     }
   }
@@ -309,11 +413,61 @@ export default function App() {
     }
   }
 
+  /* ---------- ASR handlers ---------- */
+  function ensureASR() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition || null;
+    if (!SR) {
+      setError("当前浏览器不支持语音识别，请使用 Chrome/Edge。");
+      return null;
+    }
+    const rec = new SR();
+    rec.lang = "zh-CN";
+    rec.continuous = false;
+    rec.interimResults = true;
+    return rec;
+  }
+  function startASR() {
+    const rec = ensureASR();
+    if (!rec) return;
+    recognitionRef.current = rec;
+    setRecOn(true);
+    let finalTxt = "";
+    rec.onresult = (evt) => {
+      let txt = "";
+      for (let i = evt.resultIndex; i < evt.results.length; i++) {
+        const res = evt.results[i];
+        txt += res[0].transcript;
+        if (res.isFinal) finalTxt = txt;
+      }
+      setInput(txt); // 实时写入输入框
+    };
+    rec.onerror = (e) => {
+      setError("ASR 错误：" + e.error);
+      setRecOn(false);
+    };
+    rec.onend = () => {
+      setRecOn(false);
+      if (finalTxt.trim()) sendMessage();
+    };
+    try {
+      rec.start();
+    } catch {}
+  }
+  function stopASR() {
+    recognitionRef.current?.stop();
+    setRecOn(false);
+  }
+
+  /* ---------------- UI ---------------- */
   return (
-    <div className="h-screen w-screen bg-slate-50 text-slate-900 flex">
-      {/* Sidebar: sessions + settings */}
-      <aside className="w-80 border-r border-slate-200 bg-white flex flex-col">
-        <div className="p-3 border-b border-slate-200 flex items-center gap-2">
+    // 两列布局：左侧固定宽度，右侧自适应；全高填充
+    <div
+      className="grid h-screen w-screen bg-slate-50 text-slate-900"
+      style={{ gridTemplateColumns: "var(--sidebar-width, 320px) 1fr" }}
+    >
+      {/* 左侧边栏：会话 + 可折叠设置 */}
+      <aside className="col-start-1 bg-white border-r border-slate-200 flex flex-col overflow-y-auto h-full">
+        <div className="p-3 border-b border-slate-200 flex items-center gap-2 flex-shrink-0">
           <span className="font-semibold">会话</span>
           <button
             onClick={handleCreateSession}
@@ -323,9 +477,9 @@ export default function App() {
           </button>
         </div>
 
-        <div className="p-2 overflow-y-auto flex-1">
+        <div className="p-2 flex-1 overflow-y-auto">
           {sessions?.length ? (
-            sessions.map(s => (
+            sessions.map((s) => (
               <button
                 key={s.session_id}
                 onClick={() => setSid(s.session_id)}
@@ -335,11 +489,14 @@ export default function App() {
                     ? "bg-slate-900 text-white border-slate-900"
                     : "bg-white hover:bg-slate-50 border-slate-200"
                 )}
+                title={s.session_id}
               >
                 <div className="text-sm font-medium truncate">
                   {s.character_name || "未绑定角色"}
                 </div>
-                <div className="text-xs opacity-70 truncate">{s.session_id}</div>
+                <div className="text-xs opacity-70 truncate font-mono">
+                  {s.session_id}
+                </div>
               </button>
             ))
           ) : (
@@ -347,80 +504,126 @@ export default function App() {
           )}
         </div>
 
-        {/* Settings */}
-        <div className="p-3 border-t border-slate-200 text-xs space-y-3">
-          <div className="flex items-center gap-2">
-            <span className="shrink-0">后端地址</span>
-            <input
-              className="border rounded px-2 py-1 w-full"
-              value={baseUrl}
-              onChange={e => setBaseUrl(e.target.value)}
-            />
-          </div>
+        {/* 底部：应用设置（可折叠） */}
+        <div className="border-t border-slate-200 p-3 flex-shrink-0 mt-auto">
+          <button
+            onClick={() => setShowSettings(!showSettings)}
+            className="w-full text-left font-semibold text-sm py-1 flex items-center justify-between"
+          >
+            应用设置
+            <span>{showSettings ? "▲" : "▼"}</span>
+          </button>
+          {showSettings && (
+            <div className="text-xs space-y-3 pt-2">
+              {/* backend */}
+              <div className="flex items-center gap-2 min-w-[200px]">
+                <span className="shrink-0">后端地址</span>
+                <input
+                  className="border rounded px-2 py-1 w-full"
+                  value={baseUrl}
+                  onChange={(e) => setBaseUrl(e.target.value)}
+                />
+              </div>
 
-          {/* Curated models + custom box */}
-          <div className="space-y-1">
-            <div className="text-[11px] opacity-70">推荐模型（选其一，右侧手写优先生效）</div>
-            <div className="flex items-center gap-2">
-              <select
-                className="border rounded px-2 py-1 w-1/2"
-                value={modelSelect}
-                onChange={e => setModelSelect(e.target.value)}
-              >
-                <option value="">（不选择）</option>
-                {models.map(m => (
-                  <option key={m.id} value={m.id}>
-                    {(m.label || m.id) + (m.recommended ? " ·默认" : "")}
-                  </option>
-                ))}
-              </select>
-              <input
-                className="border rounded px-2 py-1 w-1/2"
-                placeholder="手写模型名（优先）"
-                value={modelCustom}
-                onChange={e => setModelCustom(e.target.value)}
-              />
+              {/* curated models + custom */}
+              <div className="space-y-1 min-w-[300px]">
+                <div className="text-[11px] opacity-70">推荐模型（选其一，右侧手写优先生效）</div>
+                <div className="flex items-center gap-2">
+                  <select
+                    className="border rounded px-2 py-1 w-1/2"
+                    value={modelSelect}
+                    onChange={(e) => setModelSelect(e.target.value)}
+                  >
+                    <option value="">（不选择）</option>
+                    {models.map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {(m.label || m.id) + (m.recommended ? " ·默认" : "")}
+                      </option>
+                    ))}
+                  </select>
+                  <input
+                    className="border rounded px-2 py-1 w-1/2"
+                    placeholder="手写模型名（优先）"
+                    value={modelCustom}
+                    onChange={(e) => setModelCustom(e.target.value)}
+                  />
+                </div>
+              </div>
+
+              {/* fallback default model */}
+              <div className="flex items-center gap-2 min-w-[200px]">
+                <span className="shrink-0">默认模型(兜底)</span>
+                <input
+                  className="border rounded px-2 py-1 w-full"
+                  value={defaultModel}
+                  onChange={(e) => setDefaultModel(e.target.value)}
+                />
+              </div>
+
+              {/* TTS settings */}
+              <div className="space-y-1 min-w-[250px]">
+                <div className="text-[11px] opacity-70">语音合成</div>
+                <div className="flex items-center gap-2">
+                  <select
+                    className="border rounded px-2 py-1 w-2/3"
+                    value={voiceType}
+                    onChange={(e) => setVoiceType(e.target.value)}
+                  >
+                    {voices.map((v) => (
+                      <option key={v.voice_type} value={v.voice_type}>
+                        {v.voice_name || v.voice_type}
+                      </option>
+                    ))}
+                  </select>
+                  <label className="text-xs flex items-center gap-1">
+                    <input
+                      type="checkbox"
+                      checked={autoSpeak}
+                      onChange={(e) => setAutoSpeak(e.target.checked)}
+                    />
+                    自动朗读
+                  </label>
+                </div>
+              </div>
             </div>
-          </div>
-
-          {/* Fallback default model (backend default if omitted) */}
-          <div className="flex items-center gap-2">
-            <span className="shrink-0">默认模型(兜底)</span>
-            <input
-              className="border rounded px-2 py-1 w-full"
-              value={defaultModel}
-              onChange={e => setDefaultModel(e.target.value)}
-            />
-          </div>
+          )}
         </div>
       </aside>
 
-      {/* Main */}
-      <main className="flex-1 flex flex-col">
-        {/* Header: character bind + SID */}
-        <div className="h-14 border-b border-slate-200 bg-white flex items-center px-4 gap-3">
+      {/* 右侧主聊天区：头部 / 消息 / 输入区 */}
+      <div className="col-start-2 flex flex-col overflow-hidden h-full">
+        {/* Header */}
+        <div className="h-14 border-b border-slate-200 bg-white flex items-center px-4 gap-3 flex-shrink-0">
           <div className="font-semibold">角色</div>
           <select
             className="border rounded px-2 py-1"
-            value={bindCharId || ""}
-            onChange={e => handleBindCharacter(Number(e.target.value))}
+            value={currentCharId ?? ""}
+            onChange={(e) => handleBindCharacter(e.target.value)}
           >
             <option value="">（未绑定）</option>
-            {chars.map(c => (
+            {chars.map((c) => (
               <option key={c.id} value={c.id}>
                 {c.name}
               </option>
             ))}
           </select>
-          <div className="ml-auto text-xs opacity-60">
-            SID: <span className="font-mono">{sid || "—"}</span>
+          <div className="ml-auto text-xs opacity-60 flex items-center gap-4">
+            <span>
+              SID: <span className="font-mono">{sid || "—"}</span>
+            </span>
+            <span>
+              模型: <span className="font-mono">{modelCustom || modelSelect || defaultModel || "后端默认"}</span>
+            </span>
           </div>
         </div>
 
         {/* Messages */}
         <div className="flex-1 overflow-y-auto p-4">
           {messages.map((m, i) => (
-            <div key={i} className={clsx("mb-3 flex", m.role === "user" ? "justify-end" : "justify-start")}>
+            <div
+              key={i}
+              className={clsx("mb-3 flex", m.role === "user" ? "justify-end" : "justify-start")}
+            >
               <div
                 className={clsx(
                   "max-w-[75%] rounded-2xl px-3 py-2 whitespace-pre-wrap break-words",
@@ -438,7 +641,7 @@ export default function App() {
         </div>
 
         {/* Composer */}
-        <div className="border-t border-slate-200 bg-white p-3">
+        <div className="border-t border-slate-200 bg-white p-3 flex-shrink-0">
           {error && (
             <div className="mb-2 text-sm text-red-600 bg-red-50 border border-red-200 rounded px-3 py-2">
               {String(error)}
@@ -451,10 +654,20 @@ export default function App() {
               className="flex-1 border rounded-md px-3 py-2 outline-none focus:ring-2 focus:ring-slate-300"
               placeholder="输入消息，Enter发送，Shift+Enter换行"
               value={input}
-              onChange={e => setInput(e.target.value)}
+              onChange={(e) => setInput(e.target.value)}
               onKeyDown={onKeyDown}
               disabled={sending || streaming}
             />
+            <button
+              onClick={recOn ? stopASR : startASR}
+              className={clsx(
+                "px-3 py-2 rounded-md border",
+                recOn ? "bg-red-50 border-red-200 text-red-600" : "bg-white border-slate-200"
+              )}
+              title="语音输入"
+            >
+              {recOn ? "停止" : "🎤 语音"}
+            </button>
             <button
               onClick={sendMessage}
               disabled={sending || streaming || !input.trim()}
@@ -471,7 +684,10 @@ export default function App() {
             <span className="font-mono"> {defaultModel || "（后端默认）"}</span>
           </div>
         </div>
-      </main>
+      </div>
+
+      {/* hidden audio for TTS */}
+      <audio ref={audioRef} hidden />
     </div>
   );
 }
