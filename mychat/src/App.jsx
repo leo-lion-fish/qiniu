@@ -5,7 +5,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
  *
  * 后端接口（FastAPI）：
  *   GET  /characters
- *   GET  /sessions                      -> 建议返回 { session_id, character_id?, character_name? }
+ *   GET  /sessions                      -> 建议返回 { session_id, character_id?, character_name?, created_at, last_active_at }
  *   GET  /sessions/{sid}/messages
  *   POST /sessions/{sid}/bind-character -> { character_id }
  *   POST /chat                          -> { session_id, message, model? }
@@ -47,6 +47,12 @@ function useLocalStorage(key, initialValue) {
   }, [key, state]);
   return [state, setState];
 }
+// 简单时间格式化，用于左侧会话列表显示“最后活跃时间”
+function fmtTime(s) {
+  if (!s) return "";
+  const d = new Date(s);
+  return Number.isNaN(d.getTime()) ? "" : d.toLocaleString();
+}
 
 /* ======================================================================= */
 export default function App() {
@@ -63,7 +69,7 @@ export default function App() {
 
   /* ---------- Characters ---------- */
   const [chars, setChars] = useState([]);
-  // ☆ 关键：当前“会话”的绑定角色，仅用于UI展示（不再用全局 localStorage 记忆）
+  // 当前“会话”的绑定角色，仅用于UI展示
   const [currentCharId, setCurrentCharId] = useState(null);
 
   /* ---------- Models (curated + custom) ---------- */
@@ -148,7 +154,7 @@ export default function App() {
             const { value, done } = await reader.read();
             if (done) break;
             buf += decoder.decode(value, { stream: true });
-            const lines = buf.split(/\r?\n/);
+            const lines = buf.split(new RegExp('\\r?\\n'));
             buf = lines.pop() || "";
             for (const line of lines) {
               const s = line.trim();
@@ -285,8 +291,6 @@ export default function App() {
     if (val === "" || val === null) {
       setCurrentCharId(null);
       // 如需后端“解绑”可在此调用相应接口
-      // await api.unbindCharacter?.(sid)
-      // 同步更新列表里的当前会话显示
       setSessions((prev) => prev.map((s) => (s.session_id === sid ? { ...s, character_id: null, character_name: undefined } : s)));
       return;
     }
@@ -401,7 +405,7 @@ export default function App() {
       setSending(false);
       inputRef.current?.focus();
       try {
-        setSessions(await api.getSessions()); // 刷新会话，带出最新角色名
+        setSessions(await api.getSessions()); // 刷新会话，带出最新角色/时间
       } catch {}
     }
   }
@@ -489,13 +493,14 @@ export default function App() {
                     ? "bg-slate-900 text-white border-slate-900"
                     : "bg-white hover:bg-slate-50 border-slate-200"
                 )}
-                title={s.session_id}
+                title={`SID: ${s.session_id}
+最后活跃：${fmtTime(s.last_active_at || s.created_at)}`}
               >
                 <div className="text-sm font-medium truncate">
                   {s.character_name || "未绑定角色"}
                 </div>
-                <div className="text-xs opacity-70 truncate font-mono">
-                  {s.session_id}
+                <div className="text-xs opacity-70 truncate">
+                  {fmtTime(s.last_active_at || s.created_at) || "—"}
                 </div>
               </button>
             ))
