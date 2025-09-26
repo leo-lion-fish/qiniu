@@ -320,3 +320,50 @@ async def list_models():
         models.insert(0, {"id": default_model, "label": default_model, "recommended": True})
 
     return {"default": default_model, "models": models}
+
+# ---- 新增：TTS & VoiceList 代理 ----
+from fastapi import Body
+import os, aiohttp, base64
+
+QINIU_BASE = os.getenv("QINIU_OPENAI_BASE", "https://openai.qiniu.com/v1").rstrip("/")
+QINIU_KEY  = os.getenv("QINIU_OPENAI_API_KEY", "")
+
+@app.get("/voice/list")
+async def voice_list_proxy():
+    url = f"{QINIU_BASE}/voice/list"
+    headers = {"Authorization": f"Bearer {QINIU_KEY}"} if QINIU_KEY else {}
+    async with aiohttp.ClientSession() as s:
+        async with s.get(url, headers=headers) as r:
+            return await r.json()
+
+class TTSIn(BaseModel):
+    voice_type: str
+    text: str
+    encoding: str = "mp3"
+    speed_ratio: float = 1.0
+
+@app.post("/voice/tts")
+async def tts_proxy(body: TTSIn):
+    """
+    请求七牛 /voice/tts，返回 { audio: <data:audio/mp3;base64,...> , duration_ms }
+    """
+    url = f"{QINIU_BASE}/voice/tts"
+    headers = {
+        "Authorization": f"Bearer {QINIU_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "audio": {
+            "voice_type": body.voice_type,
+            "encoding": body.encoding,
+            "speed_ratio": body.speed_ratio
+        },
+        "request": { "text": body.text }
+    }
+    async with aiohttp.ClientSession() as s:
+        async with s.post(url, headers=headers, json=payload) as r:
+            data = await r.json()
+            # 七牛返回 data 为 base64 音频，addition.duration 为毫秒
+            b64 = data.get("data", "")
+            dur = (data.get("addition") or {}).get("duration")
+            return { "audio": f"data:audio/{body.encoding};base64,{b64}", "duration_ms": int(dur) if dur else None }
