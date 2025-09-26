@@ -1,18 +1,20 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
 /**
- * App.jsx — 前端最小成品（多轮会话 / 角色会话级绑定 / 模型选择 / 流式SSE / TTS / 浏览器ASR）
+ * App.jsx — 会话管理（重命名/删除）+ 多轮会话 + 角色绑定 + 模型优先级 + 流式SSE + TTS + 浏览器ASR
  *
  * 后端接口（FastAPI）：
- *   GET  /characters
- *   GET  /sessions                      -> 建议返回 { session_id, character_id?, character_name?, created_at, last_active_at }
- *   GET  /sessions/{sid}/messages
- *   POST /sessions/{sid}/bind-character -> { character_id }
- *   POST /chat                          -> { session_id, message, model? }
- *   POST /chat/stream                   -> SSE（data:{"content"} | "[DONE]")
- *   GET  /models                        -> { default, models: [{id,label?,recommended?}] }
- *   GET  /voice/list                    -> [{ voice_name, voice_type, ... }]
- *   POST /voice/tts                     -> { audio: "data:audio/mp3;base64,...", duration_ms }
+ *   GET    /characters
+ *   GET    /sessions                      -> [{ session_id, character_id?, character_name?, title?, created_at, last_active_at }]
+ *   GET    /sessions/{sid}/messages
+ *   POST   /sessions/{sid}/bind-character -> { character_id }
+ *   POST   /chat                          -> { session_id, message, model? }
+ *   POST   /chat/stream                   -> SSE（data:{"content"} | "[DONE]")
+ *   PATCH  /sessions/{sid}                -> { title }
+ *   DELETE /sessions/{sid}                -> { deleted: 1 }
+ *   GET    /models
+ *   GET    /voice/list
+ *   POST   /voice/tts
  */
 
 const BASE_URL_DEFAULT =
@@ -47,7 +49,7 @@ function useLocalStorage(key, initialValue) {
   }, [key, state]);
   return [state, setState];
 }
-// 简单时间格式化，用于左侧会话列表显示“最后活跃时间”
+// 简单时间格式化（左侧显示“最后活跃时间”）
 function fmtTime(s) {
   if (!s) return "";
   const d = new Date(s);
@@ -69,7 +71,6 @@ export default function App() {
 
   /* ---------- Characters ---------- */
   const [chars, setChars] = useState([]);
-  // 当前“会话”的绑定角色，仅用于UI展示
   const [currentCharId, setCurrentCharId] = useState(null);
 
   /* ---------- Models (curated + custom) ---------- */
@@ -116,16 +117,41 @@ export default function App() {
         return r.json();
       },
       async getMessages(sid) {
-        const r = await fetch(`${baseUrl}/sessions/${encodeURIComponent(sid)}/messages`);
+        const r = await fetch(
+          `${baseUrl}/sessions/${encodeURIComponent(sid)}/messages`
+        );
         if (!r.ok) throw new Error(await r.text());
         return r.json();
       },
       async bindCharacter(sid, character_id) {
-        const r = await fetch(`${baseUrl}/sessions/${encodeURIComponent(sid)}/bind-character`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ character_id }),
-        });
+        const r = await fetch(
+          `${baseUrl}/sessions/${encodeURIComponent(sid)}/bind-character`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ character_id }),
+          }
+        );
+        if (!r.ok) throw new Error(await r.text());
+        return r.json();
+      },
+      async renameSession(sid, title) {
+        const r = await fetch(
+          `${baseUrl}/sessions/${encodeURIComponent(sid)}`,
+          {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ title }),
+          }
+        );
+        if (!r.ok) throw new Error(await r.text());
+        return r.json();
+      },
+      async deleteSession(sid) {
+        const r = await fetch(
+          `${baseUrl}/sessions/${encodeURIComponent(sid)}`,
+          { method: "DELETE" }
+        );
         if (!r.ok) throw new Error(await r.text());
         return r.json();
       },
@@ -154,9 +180,12 @@ export default function App() {
             const { value, done } = await reader.read();
             if (done) break;
             buf += decoder.decode(value, { stream: true });
-            const lines = buf.split(new RegExp('\\r?\\n'));
-            buf = lines.pop() || "";
-            for (const line of lines) {
+
+            // 手写分行：避免正则字面量引起的 oxc 误判
+            let nl;
+            while ((nl = buf.indexOf("\n")) !== -1) {
+              const line = buf.slice(0, nl);
+              buf = buf.slice(nl + 1);
               const s = line.trim();
               if (!s.startsWith("data:")) continue;
               const payload = s.slice(5).trim();
@@ -166,7 +195,7 @@ export default function App() {
                 if (obj.content) yield obj.content;
                 if (obj.error) throw new Error(obj.error);
               } catch {
-                /* ignore malformed chunk */
+                // ignore malformed chunk
               }
             }
           }
@@ -213,25 +242,25 @@ export default function App() {
             if (!modelSelect && data.default) setModelSelect(data.default);
             if (!defaultModel && data.default) setDefaultModel(data.default);
           }
-        } catch {
-          /* optional */
-        }
+        } catch {}
 
         // voice list
         try {
           const vs = await api.getVoiceList();
           setVoices(vs || []);
           if (!voiceType) {
-            const v = (vs || []).find((x) => String(x.voice_type || "").startsWith("qiniu_zh_female")) || vs?.[0];
+            const v =
+              (vs || []).find((x) =>
+                String(x.voice_type || "").startsWith("qiniu_zh_female")
+              ) || vs?.[0];
             if (v?.voice_type) setVoiceType(v.voice_type);
           }
-        } catch {
-          /* optional */
-        }
+        } catch {}
 
         // ensure sid
         if (!sid) {
-          const first = sRes.status === "fulfilled" ? sRes.value?.[0]?.session_id : null;
+          const first =
+            sRes.status === "fulfilled" ? sRes.value?.[0]?.session_id : null;
           setSid(first || uuidv4());
         }
       } catch (e) {
@@ -257,14 +286,17 @@ export default function App() {
     })();
   }, [sid, api]);
 
-  /* ---------- 当会话或会话列表变化时，同步当前会话的角色到下拉框 ---------- */
+  /* ---------- 同步：当前会话的角色到下拉框（找不到当前会话时“不覆盖”） ---------- */
   useEffect(() => {
     if (!sid) return;
     const cur = sessions.find((s) => s.session_id === sid);
-    // 后端若返回 character_id 则直接用；否则尝试由 character_name 反查
-    if (cur?.character_id != null) {
+    if (!cur) {
+      // 列表里还没有这个会话（比如刚新建），保持现状，不覆盖用户刚刚的选择
+      return;
+    }
+    if (cur.character_id != null) {
       setCurrentCharId(cur.character_id);
-    } else if (cur?.character_name) {
+    } else if (cur.character_name) {
       const found = chars.find((c) => c.name === cur.character_name);
       setCurrentCharId(found?.id ?? null);
     } else {
@@ -287,11 +319,15 @@ export default function App() {
 
   async function handleBindCharacter(val) {
     if (!sid) return;
-    // 允许“未绑定”
     if (val === "" || val === null) {
       setCurrentCharId(null);
-      // 如需后端“解绑”可在此调用相应接口
-      setSessions((prev) => prev.map((s) => (s.session_id === sid ? { ...s, character_id: null, character_name: undefined } : s)));
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.session_id === sid
+            ? { ...s, character_id: null, character_name: undefined }
+            : s
+        )
+      );
       return;
     }
     const idNum = Number(val);
@@ -300,9 +336,33 @@ export default function App() {
       await api.bindCharacter(sid, idNum);
       setCurrentCharId(idNum);
       const newName = chars.find((c) => c.id === idNum)?.name;
-      setSessions((prev) =>
-        prev.map((s) => (s.session_id === sid ? { ...s, character_id: idNum, character_name: newName ?? s.character_name } : s))
-      );
+      setSessions((prev) => {
+        const exists = prev.some((s) => s.session_id === sid);
+        if (exists) {
+          return prev.map((s) =>
+            s.session_id === sid
+              ? {
+                  ...s,
+                  character_id: idNum,
+                  character_name: newName ?? s.character_name,
+                }
+              : s
+          );
+        }
+        // 会话列表还没有当前 sid（刚新建），插入一条最小信息；时间用 now 兜底
+        const now = new Date().toISOString();
+        return [
+          ...prev,
+          {
+            session_id: sid,
+            character_id: idNum,
+            character_name: newName,
+            title: "",
+            created_at: now,
+            last_active_at: now,
+          },
+        ];
+      });
     } catch (e) {
       setError("绑定角色失败：" + String(e));
     }
@@ -314,9 +374,7 @@ export default function App() {
       const { audio } = await api.tts(voiceType, text, "mp3", 1.0);
       if (audioRef.current) {
         audioRef.current.src = audio;
-        await audioRef.current.play().catch(() => {
-          /* 首次可能需要用户手势 */
-        });
+        await audioRef.current.play().catch(() => {});
       }
     } catch (e) {
       console.warn("TTS 播放失败：", e);
@@ -391,10 +449,11 @@ export default function App() {
           return copy;
         });
       } else {
-        setMessages((prev) => prev.map((m) => (m._streaming ? { ...m, _streaming: false } : m)));
+        setMessages((prev) =>
+          prev.map((m) => (m._streaming ? { ...m, _streaming: false } : m))
+        );
       }
 
-      // TTS
       await speakIfNeeded(acc);
     } catch (e) {
       console.error(e);
@@ -405,7 +464,7 @@ export default function App() {
       setSending(false);
       inputRef.current?.focus();
       try {
-        setSessions(await api.getSessions()); // 刷新会话，带出最新角色/时间
+        setSessions(await api.getSessions()); // 刷新会话列表（带出最新 title/时间）
       } catch {}
     }
   }
@@ -414,6 +473,42 @@ export default function App() {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       sendMessage();
+    }
+  }
+
+  // --- 重命名 / 删除 ---
+  async function handleRenameSession(e, s) {
+    e.stopPropagation();
+    const t = prompt("会话标题", s.title || s.character_name || "");
+    if (t == null) return;
+    try {
+      await api.renameSession(s.session_id, String(t).trim());
+      const list = await api.getSessions();
+      setSessions(list || []);
+    } catch (err) {
+      setError("重命名失败：" + String(err));
+    }
+  }
+
+  async function handleDeleteSession(e, s) {
+    e.stopPropagation();
+    if (!confirm("确定删除该会话及其全部消息？此操作不可撤销。")) return;
+    try {
+      await api.deleteSession(s.session_id);
+      const list = await api.getSessions();
+      setSessions(list || []);
+      if (s.session_id === sid) {
+        const first = list?.[0]?.session_id;
+        if (first) setSid(first);
+        else {
+          const newSid = uuidv4();
+          setSid(newSid);
+          setMessages([]);
+          setCurrentCharId(null);
+        }
+      }
+    } catch (err) {
+      setError("删除失败：" + String(err));
     }
   }
 
@@ -443,7 +538,7 @@ export default function App() {
         txt += res[0].transcript;
         if (res.isFinal) finalTxt = txt;
       }
-      setInput(txt); // 实时写入输入框
+      setInput(txt);
     };
     rec.onerror = (e) => {
       setError("ASR 错误：" + e.error);
@@ -464,7 +559,6 @@ export default function App() {
 
   /* ---------------- UI ---------------- */
   return (
-    // 两列布局：左侧固定宽度，右侧自适应；全高填充
     <div
       className="grid h-screen w-screen bg-slate-50 text-slate-900"
       style={{ gridTemplateColumns: "var(--sidebar-width, 320px) 1fr" }}
@@ -483,29 +577,65 @@ export default function App() {
 
         <div className="p-2 flex-1 overflow-y-auto">
           {sessions?.length ? (
-            sessions.map((s) => (
-              <button
-                key={s.session_id}
-                onClick={() => setSid(s.session_id)}
-                className={clsx(
-                  "w-full text-left px-3 py-2 rounded-md mb-2 border",
-                  sid === s.session_id
-                    ? "bg-slate-900 text-white border-slate-900"
-                    : "bg-white hover:bg-slate-50 border-slate-200"
-                )}
-                title={`SID: ${s.session_id}
-最后活跃：${fmtTime(s.last_active_at || s.created_at)}`}
-              >
-                <div className="text-sm font-medium truncate">
-                  {s.character_name || "未绑定角色"}
-                </div>
-                <div className="text-xs opacity-70 truncate">
-                  {fmtTime(s.last_active_at || s.created_at) || "—"}
-                </div>
-              </button>
-            ))
+            sessions.map((s) => {
+              const active = sid === s.session_id;
+              return (
+                <button
+                  key={s.session_id}
+                  onClick={() => setSid(s.session_id)}
+                  className={clsx(
+                    "w-full text-left px-3 py-2 rounded-md mb-2 border group",
+                    active
+                      ? "bg-slate-900 text-white border-slate-900"
+                      : "bg-white hover:bg-slate-50 border-slate-200"
+                  )}
+                  title={`SID: ${s.session_id}\n最后活跃：${fmtTime(
+                    s.last_active_at || s.created_at
+                  )}`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="text-sm font-medium truncate">
+                      {s.title?.trim() || s.character_name || "未绑定角色"}
+                    </div>
+                    {active && (
+                      <div className="ml-2 shrink-0 flex gap-1">
+                        <button
+                          className={clsx(
+                            "px-1.5 py-0.5 text-xs rounded border",
+                            active
+                              ? "border-slate-300 bg-white/10 hover:bg-white/20"
+                              : "border-slate-300 hover:bg-slate-50"
+                          )}
+                          title="重命名会话"
+                          onClick={(e) => handleRenameSession(e, s)}
+                        >
+                          ✏️
+                        </button>
+                        <button
+                          className={clsx(
+                            "px-1.5 py-0.5 text-xs rounded border text-red-600",
+                            active
+                              ? "border-red-300 bg-white/10 hover:bg-red-50/20"
+                              : "border-red-300 hover:bg-red-50"
+                          )}
+                          title="删除会话"
+                          onClick={(e) => handleDeleteSession(e, s)}
+                        >
+                          🗑️
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                  <div className="text-xs opacity-70 truncate">
+                    {fmtTime(s.last_active_at || s.created_at) || "—"}
+                  </div>
+                </button>
+              );
+            })
           ) : (
-            <div className="text-sm text-slate-500 p-3">暂无会话，点“新建”创建一个。</div>
+            <div className="text-sm text-slate-500 p-3">
+              暂无会话，点“新建”创建一个。
+            </div>
           )}
         </div>
 
@@ -532,7 +662,9 @@ export default function App() {
 
               {/* curated models + custom */}
               <div className="space-y-1 min-w-[300px]">
-                <div className="text-[11px] opacity-70">推荐模型（选其一，右侧手写优先生效）</div>
+                <div className="text-[11px] opacity-70">
+                  推荐模型（选其一，右侧手写优先生效）
+                </div>
                 <div className="flex items-center gap-2">
                   <select
                     className="border rounded px-2 py-1 w-1/2"
@@ -567,7 +699,7 @@ export default function App() {
 
               {/* TTS settings */}
               <div className="space-y-1 min-w-[250px]">
-                <div className="text-[11px] opacity-70">语音合成</div>
+                <div className="text:[11px] opacity-70">语音合成</div>
                 <div className="flex items-center gap-2">
                   <select
                     className="border rounded px-2 py-1 w-2/3"
@@ -617,7 +749,10 @@ export default function App() {
               SID: <span className="font-mono">{sid || "—"}</span>
             </span>
             <span>
-              模型: <span className="font-mono">{modelCustom || modelSelect || defaultModel || "后端默认"}</span>
+              模型:{" "}
+              <span className="font-mono">
+                {modelCustom || modelSelect || defaultModel || "后端默认"}
+              </span>
             </span>
           </div>
         </div>
@@ -627,12 +762,17 @@ export default function App() {
           {messages.map((m, i) => (
             <div
               key={i}
-              className={clsx("mb-3 flex", m.role === "user" ? "justify-end" : "justify-start")}
+              className={clsx(
+                "mb-3 flex",
+                m.role === "user" ? "justify-end" : "justify-start"
+              )}
             >
               <div
                 className={clsx(
                   "max-w-[75%] rounded-2xl px-3 py-2 whitespace-pre-wrap break-words",
-                  m.role === "user" ? "bg-slate-900 text-white" : "bg-white border border-slate-200"
+                  m.role === "user"
+                    ? "bg-slate-900 text-white"
+                    : "bg-white border border-slate-200"
                 )}
               >
                 {m.content || ""}
@@ -667,7 +807,9 @@ export default function App() {
               onClick={recOn ? stopASR : startASR}
               className={clsx(
                 "px-3 py-2 rounded-md border",
-                recOn ? "bg-red-50 border-red-200 text-red-600" : "bg-white border-slate-200"
+                recOn
+                  ? "bg-red-50 border-red-200 text-red-600"
+                  : "bg-white border-slate-200"
               )}
               title="语音输入"
             >
@@ -678,14 +820,17 @@ export default function App() {
               disabled={sending || streaming || !input.trim()}
               className={clsx(
                 "px-4 py-2 rounded-md text-white",
-                sending || streaming || !input.trim() ? "bg-slate-400" : "bg-slate-900 hover:bg-black"
+                sending || streaming || !input.trim()
+                  ? "bg-slate-400"
+                  : "bg-slate-900 hover:bg-black"
               )}
             >
               发送
             </button>
           </div>
           <div className="text-xs opacity-70 mt-1">
-            当前使用模型优先级：<code>手写</code> → <code>下拉</code> → <code>默认(兜底)</code>。兜底当前：
+            当前使用模型优先级：<code>手写</code> → <code>下拉</code> →{" "}
+            <code>默认(兜底)</code>。兜底当前：
             <span className="font-mono"> {defaultModel || "（后端默认）"}</span>
           </div>
         </div>

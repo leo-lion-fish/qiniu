@@ -2,7 +2,7 @@
 """
 项目根目录的 main.py（与 app/ 目录同级）
 - 聊天（非流式/流式）
-- 会话/历史查询
+- 会话/历史查询、会话重命名、删除
 - 角色：列表、创建、绑定到会话
 - 会话中未显式传角色时，自动读取会话已绑定的角色
 - 模型选择：优先 本轮指定 -> 会话默认(如实现) -> 全局默认（.env 的 LLM_MODEL）
@@ -22,7 +22,14 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.redis_cache import get_redis, get_history, append_pair
 from app.characters import build_system_prompt
-from app.crud import add_turn, load_history_from_db, list_sessions, list_messages
+from app.crud import (
+    add_turn,
+    load_history_from_db,
+    list_sessions,
+    list_messages,
+    rename_session,
+    delete_session,
+)
 from app.qiniu_llm import chat_completion, chat_completion_stream
 from app.models import CharacterInfo, ChatSession
 
@@ -62,6 +69,10 @@ class CharacterIn(BaseModel):
 class BindCharacterIn(BaseModel):
     character_id: Optional[int] = None
     character_name: Optional[str] = None
+
+class SessionTitleIn(BaseModel):
+    """重命名会话"""
+    title: str
 
 # =========================
 # 工具函数
@@ -265,17 +276,33 @@ def bind_character(sid: str, body: BindCharacterIn, db: Session = Depends(get_db
     return {"session_id": sid, "character_id": char.id, "character_name": char.name}
 
 # =========================
-# 路由：历史查询
+# 路由：会话列表/消息/重命名/删除
 # =========================
 @app.get("/sessions")
 def sessions(db=Depends(get_db)):
-    """会话列表：按最近活跃时间倒序"""
+    """会话列表：当前按最近活跃时间倒序返回（包含 title/created_at/last_active_at）"""
     return list_sessions(db)
 
 @app.get("/sessions/{sid}/messages")
 def session_messages(sid: str, limit: int = 500, db=Depends(get_db)):
     """某个会话的消息记录（升序返回）"""
     return list_messages(db, sid, limit=limit)
+
+@app.patch("/sessions/{sid}")
+def patch_session(sid: str, body: SessionTitleIn, db: Session = Depends(get_db)):
+    """重命名会话"""
+    title = (body.title or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="title is required")
+    try:
+        return rename_session(db, sid, title)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="session not found")
+
+@app.delete("/sessions/{sid}")
+def remove_session(sid: str, db: Session = Depends(get_db)):
+    """删除会话（级联删除消息）"""
+    return delete_session(db, sid)
 
 # =========================
 # 健康检查
@@ -284,6 +311,9 @@ def session_messages(sid: str, limit: int = 500, db=Depends(get_db)):
 def health():
     return {"ok": True}
 
+# =========================
+# 精选模型 & 语音 TTS 代理
+# =========================
 import os
 import aiohttp
 
@@ -321,18 +351,18 @@ async def list_models():
 
     return {"default": default_model, "models": models}
 
-# ---- 新增：TTS & VoiceList 代理 ----
-from fastapi import Body
-import os, aiohttp, base64
+# ---- TTS & VoiceList 代理 ----
+from fastapi import Body  # 已在上面导入过 fastapi，这里仅确保 Body 可用
+import os as _os, aiohttp as _aiohttp, base64
 
-QINIU_BASE = os.getenv("QINIU_OPENAI_BASE", "https://openai.qiniu.com/v1").rstrip("/")
-QINIU_KEY  = os.getenv("QINIU_OPENAI_API_KEY", "")
+QINIU_BASE = _os.getenv("QINIU_OPENAI_BASE", "https://openai.qiniu.com/v1").rstrip("/")
+QINIU_KEY  = _os.getenv("QINIU_OPENAI_API_KEY", "")
 
 @app.get("/voice/list")
 async def voice_list_proxy():
     url = f"{QINIU_BASE}/voice/list"
     headers = {"Authorization": f"Bearer {QINIU_KEY}"} if QINIU_KEY else {}
-    async with aiohttp.ClientSession() as s:
+    async with _aiohttp.ClientSession() as s:
         async with s.get(url, headers=headers) as r:
             return await r.json()
 
@@ -360,7 +390,7 @@ async def tts_proxy(body: TTSIn):
         },
         "request": { "text": body.text }
     }
-    async with aiohttp.ClientSession() as s:
+    async with _aiohttp.ClientSession() as s:
         async with s.post(url, headers=headers, json=payload) as r:
             data = await r.json()
             # 七牛返回 data 为 base64 音频，addition.duration 为毫秒
