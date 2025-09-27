@@ -1,3 +1,5 @@
+# --- START OF FILE main.py ---
+
 # -*- coding: utf-8 -*-
 """
 项目根目录的 main.py（与 app/ 目录同级）
@@ -20,7 +22,7 @@ from sqlalchemy.orm import Session
 
 # ✅ 绝对导入 app 包内模块（确保 app/ 下有 __init__.py）
 from app.database import get_db
-from app.redis_cache import get_redis, get_history, append_pair
+from app.redis_cache import get_redis, get_history, append_pair, delete_history # <--- 导入 delete_history
 from app.characters import build_system_prompt
 from app.crud import (
     add_turn,
@@ -300,9 +302,12 @@ def patch_session(sid: str, body: SessionTitleIn, db: Session = Depends(get_db))
         raise HTTPException(status_code=404, detail="session not found")
 
 @app.delete("/sessions/{sid}")
-def remove_session(sid: str, db: Session = Depends(get_db)):
+async def remove_session(sid: str, db=Depends(get_db), rds=Depends(get_redis)): # <--- 增加 rds 依赖
     """删除会话（级联删除消息）"""
-    return delete_session(db, sid)
+    result = delete_session(db, sid)
+    if result.get("deleted") == 1:
+        await delete_history(rds, sid) # <--- 调用删除 Redis 缓存
+    return result
 
 # =========================
 # 健康检查
@@ -397,3 +402,5 @@ async def tts_proxy(body: TTSIn):
             b64 = data.get("data", "")
             dur = (data.get("addition") or {}).get("duration")
             return { "audio": f"data:audio/{body.encoding};base64,{b64}", "duration_ms": int(dur) if dur else None }
+
+# --- END OF FILE main.py ---

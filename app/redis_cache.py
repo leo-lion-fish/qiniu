@@ -1,3 +1,5 @@
+# --- START OF FILE redis_cache.py ---
+
 # -*- coding: utf-8 -*-
 """
 Redis 缓存封装
@@ -51,6 +53,11 @@ try:
         ])
         await set_history(rds, session_id, hist)
 
+    # 新增的删除函数
+    async def delete_history(rds, session_id: str):
+        """从 Redis 删除指定会话的历史记录"""
+        await rds.delete(_key(session_id))
+
 except Exception:
     # ========= 回退到同步 redis，适配异步接口 =========
     import redis  # 同步客户端
@@ -93,3 +100,10 @@ except Exception:
             {"role": "assistant", "content": assistant_msg},
         ])
         await set_history(rds, session_id, hist)
+
+    # 新增的删除函数
+    async def delete_history(rds, session_id: str):
+        """从 Redis 删除指定会话的历史记录"""
+        await _run_in_thread(rds.delete, _key(session_id))
+
+# --- END OF FILE redis_cache.py ---
