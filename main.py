@@ -22,7 +22,8 @@ from sqlalchemy.orm import Session
 
 # ✅ 绝对导入 app 包内模块（确保 app/ 下有 __init__.py）
 from app.database import get_db
-from app.redis_cache import get_redis, get_history, append_pair, delete_history # <--- 导入 delete_history
+# 导入新增的锁相关函数
+from app.redis_cache import get_redis, get_history, append_pair, delete_history, acquire_session_lock, release_session_lock
 from app.characters import build_system_prompt
 from app.crud import (
     add_turn,
@@ -125,37 +126,46 @@ async def chat(body: ChatIn, db=Depends(get_db), rds=Depends(get_redis)):
     if not body.session_id:
         raise HTTPException(status_code=400, detail="session_id required")
 
-    # 1) 会话历史
-    history = await get_history(rds, body.session_id)
-    if not history:
-        history = load_history_from_db(db, body.session_id, limit=100)
+    # --- 并发控制：尝试获取会话锁 ---
+    lock_acquired = await acquire_session_lock(rds, body.session_id)
+    if not lock_acquired:
+        raise HTTPException(status_code=409, detail="会话正在处理中，请稍后再试。") # 409 Conflict
 
-    # 2) 会话绑定角色（若未显式传）
-    _fill_bound_character_if_absent(db, body)
-
-    # 3) system prompt（基于角色人设）
-    system_prompt = build_system_prompt(db, body.character_name, body.character_id)
-    messages = assemble_messages(system_prompt, history, body.message)
-
-    # 4) 调大模型（带模型清洗）
-    chosen_model = _choose_model(body.model)
     try:
-        reply = await chat_completion(messages, model=chosen_model)
-    except Exception as e:
-        logger.exception("LLM upstream error")
-        raise HTTPException(status_code=502, detail=f"LLM upstream error: {e}")
+        # 1) 会话历史
+        history = await get_history(rds, body.session_id)
+        if not history:
+            history = load_history_from_db(db, body.session_id, limit=100)
 
-    # 5) 写缓存 + 落库
-    await append_pair(rds, body.session_id, body.message, reply)
-    add_turn(
-        db,
-        session_id=body.session_id,
-        character_id=body.character_id,
-        character_name=body.character_name,
-        user_msg=body.message,
-        assistant_msg=reply,
-    )
-    return {"reply": reply}
+        # 2) 会话绑定角色（若未显式传）
+        _fill_bound_character_if_absent(db, body)
+
+        # 3) system prompt（基于角色人设）
+        system_prompt = build_system_prompt(db, body.character_name, body.character_id)
+        messages = assemble_messages(system_prompt, history, body.message)
+
+        # 4) 调大模型（带模型清洗）
+        chosen_model = _choose_model(body.model)
+        try:
+            reply = await chat_completion(messages, model=chosen_model)
+        except Exception as e:
+            logger.exception("LLM upstream error")
+            raise HTTPException(status_code=502, detail=f"LLM upstream error: {e}")
+
+        # 5) 写缓存 + 落库
+        await append_pair(rds, body.session_id, body.message, reply)
+        add_turn(
+            db,
+            session_id=body.session_id,
+            character_id=body.character_id,
+            character_name=body.character_name,
+            user_msg=body.message,
+            assistant_msg=reply,
+        )
+        return {"reply": reply}
+    finally:
+        # --- 并发控制：无论成功失败，都释放锁 ---
+        await release_session_lock(rds, body.session_id)
 
 # =========================
 # 路由：流式聊天（SSE）
@@ -170,46 +180,58 @@ async def chat_stream(body: ChatIn, db=Depends(get_db), rds=Depends(get_redis)):
     if not body.session_id:
         raise HTTPException(status_code=400, detail="session_id required")
 
-    # 1) 会话历史
-    history = await get_history(rds, body.session_id)
-    if not history:
-        history = load_history_from_db(db, body.session_id, limit=100)
-
-    # 2) 会话绑定角色（若未显式传）
-    _fill_bound_character_if_absent(db, body)
-
-    # 3) system prompt
-    system_prompt = build_system_prompt(db, body.character_name, body.character_id)
-    messages = assemble_messages(system_prompt, history, body.message)
-
-    chosen_model = _choose_model(body.model)
+    # --- 并发控制：尝试获取会话锁 ---
+    lock_acquired = await acquire_session_lock(rds, body.session_id)
+    if not lock_acquired:
+        raise HTTPException(status_code=409, detail="会话正在处理中，请稍后再试。") # 409 Conflict
 
     async def gen():
-        acc = []
+        full_reply_content = [] # 收集完整回复
         try:
-            async for chunk in chat_completion_stream(messages, model=chosen_model):
-                acc.append(chunk)
-                # SSE 格式：以 data: 开头，空行分隔
-                yield f"data: {json.dumps({'content': chunk}, ensure_ascii=False)}\n\n"
-        except Exception as e:
-            logger.exception("LLM upstream error (stream)")
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
-            yield "data: [DONE]\n\n"
-            return
+            # 1) 会话历史
+            history = await get_history(rds, body.session_id)
+            if not history:
+                history = load_history_from_db(db, body.session_id, limit=100)
 
-        full = "".join(acc)
-        # 写缓存 + 落库
-        await append_pair(rds, body.session_id, body.message, full)
-        add_turn(
-            db,
-            session_id=body.session_id,
-            character_id=body.character_id,
-            character_name=body.character_name,
-            user_msg=body.message,
-            assistant_msg=full,
-        )
-        # 结束标记
-        yield "data: [DONE]\n\n"
+            # 2) 会话绑定角色（若未显式传）
+            _fill_bound_character_if_absent(db, body)
+
+            # 3) system prompt
+            system_prompt = build_system_prompt(db, body.character_name, body.character_id)
+            messages = assemble_messages(system_prompt, history, body.message)
+
+            chosen_model = _choose_model(body.model)
+
+            try:
+                async for chunk in chat_completion_stream(messages, model=chosen_model):
+                    full_reply_content.append(chunk)
+                    # SSE 格式：以 data: 开头，空行分隔
+                    yield f"data: {json.dumps({'content': chunk}, ensure_ascii=False)}\n\n"
+            except Exception as e:
+                logger.exception("LLM upstream error (stream)")
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                # 即使有错误，也发送 DONE 标记，让前端知道流结束
+                yield "data: [DONE]\n\n"
+                return # 异常时不再进行后续的数据库和Redis操作
+
+            full_text = "".join(full_reply_content)
+            # 写缓存 + 落库
+            await append_pair(rds, body.session_id, body.message, full_text)
+            add_turn(
+                db,
+                session_id=body.session_id,
+                character_id=body.character_id,
+                character_name=body.character_name,
+                user_msg=body.message,
+                assistant_msg=full_text,
+            )
+            # 结束标记
+            yield "data: [DONE]\n\n"
+
+        finally:
+            # --- 并发控制：无论成功失败，都释放锁 ---
+            await release_session_lock(rds, body.session_id)
+
 
     return StreamingResponse(gen(), media_type="text/event-stream; charset=utf-8")
 
@@ -302,11 +324,13 @@ def patch_session(sid: str, body: SessionTitleIn, db: Session = Depends(get_db))
         raise HTTPException(status_code=404, detail="session not found")
 
 @app.delete("/sessions/{sid}")
-async def remove_session(sid: str, db=Depends(get_db), rds=Depends(get_redis)): # <--- 增加 rds 依赖
+async def remove_session(sid: str, db=Depends(get_db), rds=Depends(get_redis)):
     """删除会话（级联删除消息）"""
     result = delete_session(db, sid)
     if result.get("deleted") == 1:
-        await delete_history(rds, sid) # <--- 调用删除 Redis 缓存
+        await delete_history(rds, sid)
+        # 删除会话时，也应尝试释放锁，防止残留
+        await release_session_lock(rds, sid)
     return result
 
 # =========================
