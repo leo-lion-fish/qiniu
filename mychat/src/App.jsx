@@ -1,3 +1,5 @@
+// --- START OF FILE App.jsx ---
+
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
 /**
@@ -85,6 +87,13 @@ export default function App() {
   const [streaming, setStreaming] = useState(false);
   const [error, setError] = useState("");
 
+  // --- New states for retry logic ---
+  const [isSessionLocked, setIsSessionLocked] = useState(false); // Whether the session is currently locked by another client
+  const [retryTimeoutId, setRetryTimeoutId] = useState(null); // Timeout ID for scheduled retries
+  const [retryAttempt, setRetryAttempt] = useState(0); // Current retry count for the *this* client's message
+  const MAX_RETRY_ATTEMPTS = 5;
+  const BASE_RETRY_DELAY_MS = 1000; // 1 second for the first retry
+
   /* ---------- TTS ---------- */
   const [voices, setVoices] = useState([]); // from /voice/list
   const [voiceType, setVoiceType] = useLocalStorage(
@@ -161,6 +170,12 @@ export default function App() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
         });
+        // --- Custom error handling for 409 ---
+        if (r.status === 409) {
+          const errBody = await r.json();
+          // Include status to allow calling function to distinguish
+          throw new Error(JSON.stringify({ status: 409, detail: errBody.detail }));
+        }
         if (!r.ok) throw new Error(await r.text());
         return r.json();
       },
@@ -170,6 +185,12 @@ export default function App() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
         });
+        // --- Custom error handling for 409 ---
+        if (r.status === 409) {
+          const errBody = await r.json();
+          // Include status to allow calling function to distinguish
+          throw new Error(JSON.stringify({ status: 409, detail: errBody.detail }));
+        }
         if (!r.ok) throw new Error(await r.text());
 
         const reader = r.body.getReader();
@@ -271,12 +292,18 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  /* ---------- Load messages on sid change ---------- */
+  /* ---------- Load messages on sid change / Reset retry state ---------- */
   useEffect(() => {
     if (!sid) return;
     (async () => {
       try {
         setError("");
+        // Reset retry states when session changes
+        setIsSessionLocked(false);
+        setRetryAttempt(0);
+        if (retryTimeoutId) clearTimeout(retryTimeoutId);
+        setRetryTimeoutId(null);
+
         const msgs = await api.getMessages(sid);
         setMessages(msgs || []);
       } catch (e) {
@@ -315,6 +342,12 @@ export default function App() {
     setSid(newSid);
     setMessages([]);
     setCurrentCharId(null);
+    setError(""); // Clear error when creating new session
+    // Reset retry states
+    setIsSessionLocked(false);
+    setRetryAttempt(0);
+    if (retryTimeoutId) clearTimeout(retryTimeoutId);
+    setRetryTimeoutId(null);
   }
 
   async function handleBindCharacter(val) {
@@ -381,98 +414,208 @@ export default function App() {
     }
   }
 
-  async function sendMessage() {
-    const text = input.trim();
-    if (!text || sending || streaming) return;
-    setError("");
-    setSending(true);
+  // Refactored sendMessage to handle retries gracefully
+  async function sendMessage(originalInputText = null, isRetry = false) {
+    const textToSend = originalInputText !== null ? originalInputText : input.trim();
+    if (!textToSend || sending || streaming) return;
 
-    // model resolution: custom > dropdown > fallback > backend default
+    // On the very first attempt for a new user message, reset all retry-related states
+    if (!isRetry) {
+      setError("");
+      setRetryAttempt(0);
+      setIsSessionLocked(false);
+      // Clear any previous retry timeouts
+      if (retryTimeoutId) clearTimeout(retryTimeoutId);
+      setRetryTimeoutId(null);
+
+      // Optimistically add user message only on the *first* send attempt
+      const newUser = {
+          role: "user",
+          content: textToSend,
+          created_at: new Date().toISOString(),
+          _optimistic: true // Mark as optimistic, to be removed on success or final failure
+      };
+      setMessages((prev) => [...prev, newUser]);
+      setInput(""); // Clear input field only on initial send
+    }
+
+    setSending(true); // Disable input and button while processing (including initial wait/retry setup)
+
     const candidate = (modelCustom || "").trim();
     const selected = (modelSelect || "").trim();
     const fallback = (defaultModel || "").trim();
     const finalModel = candidate || selected || fallback || undefined;
 
-    // optimistic append user msg
-    const newUser = {
-      role: "user",
-      content: text,
-      created_at: new Date().toISOString(),
-    };
-    setMessages((prev) => [...prev, newUser]);
-    setInput("");
-
-    // streaming path
-    setStreaming(true);
-    let acc = "";
-    setMessages((prev) => [
-      ...prev,
-      {
-        role: "assistant",
-        content: "",
-        created_at: new Date().toISOString(),
-        _streaming: true,
-      },
-    ]);
+    // Track the optimistic user message index for later updates/removal
+    let currentUserMessageIndex = -1;
+    setMessages(prev => {
+        const lastUserMsg = prev.findLast(m => m.role === 'user' && m.content === textToSend && m._optimistic);
+        if (lastUserMsg) {
+            currentUserMessageIndex = prev.indexOf(lastUserMsg);
+        }
+        return prev;
+    });
 
     try {
-      const body = { session_id: sid, message: text };
+      const body = { session_id: sid, message: textToSend };
       if (finalModel) body.model = finalModel;
 
+      let acc = "";
       let gotChunk = false;
-      for await (const chunk of api.chatStream(body)) {
-        gotChunk = true;
-        acc += chunk;
-        setMessages((prev) => {
-          const copy = [...prev];
-          for (let i = copy.length - 1; i >= 0; i--) {
-            if (copy[i].role === "assistant" && copy[i]._streaming) {
-              copy[i] = { ...copy[i], content: acc };
-              break;
-            }
+      let assistantMessageIndex = -1; // Index for the assistant's reply (placeholder or full)
+
+      // Use the api.chatStream generator directly.
+      // If it throws a 409 error, it will be caught below, and assistant placeholder won't be added.
+      const chatStreamGenerator = api.chatStream(body);
+
+      try {
+        for await (const chunk of chatStreamGenerator) {
+          // If this is the first chunk, add the assistant placeholder
+          if (!gotChunk) {
+            setMessages(prev => {
+                const copy = [...prev];
+                // Ensure assistantMessageIndex is for a new message
+                copy.push({
+                    role: "assistant",
+                    content: "", // Start with empty content
+                    created_at: new Date().toISOString(),
+                    _streaming: true,
+                });
+                assistantMessageIndex = copy.length - 1;
+                return copy;
+            });
+            setStreaming(true); // Start streaming flag once we get first chunk
           }
-          return copy;
-        });
+
+          gotChunk = true;
+          acc += chunk;
+          setMessages((prev) => {
+            const copy = [...prev];
+            // Update the content of the streaming assistant message
+            if (assistantMessageIndex !== -1 && copy[assistantMessageIndex]) {
+              copy[assistantMessageIndex] = { ...copy[assistantMessageIndex], content: acc };
+            }
+            return copy;
+          });
+        }
+      } catch (streamError) {
+          // Pass stream errors to outer catch block for 409 or other API errors.
+          throw streamError;
       }
 
-      if (!gotChunk && acc === "") {
-        const r = await api.chat(body);
-        acc = r?.reply || "";
-        setMessages((prev) => {
-          const copy = [...prev];
-          for (let i = copy.length - 1; i >= 0; i--) {
-            if (copy[i].role === "assistant" && copy[i]._streaming) {
-              copy[i] = { ...copy[i], content: acc, _streaming: false };
-              break;
+      // If no chunks were received but no error, it might be an empty reply or non-streaming reply scenario.
+      // In this specific design, we expect either chunks or an error from chatStream.
+      // If chatStream successfully completes but yields nothing, acc will be empty, which is valid for an empty response.
+      // No explicit non-streaming fallback needed here if api.chatStream is the primary interaction.
+
+      // Mark streaming complete and remove optimistic/streaming flags
+      setMessages((prev) =>
+        prev.map((m, index) => {
+            if (index === assistantMessageIndex) {
+                return { ...m, _streaming: false };
             }
-          }
-          return copy;
-        });
-      } else {
-        setMessages((prev) =>
-          prev.map((m) => (m._streaming ? { ...m, _streaming: false } : m))
-        );
-      }
+            if (index === currentUserMessageIndex) {
+                const { _optimistic, ...rest } = m; // Remove optimistic flag
+                return rest;
+            }
+            return m;
+        })
+      );
 
       await speakIfNeeded(acc);
+
+      // On successful send (after all retries, if any), reset retry state and clear ALL related error messages
+      setIsSessionLocked(false);
+      setRetryAttempt(0);
+      if (retryTimeoutId) clearTimeout(retryTimeoutId);
+      setRetryTimeoutId(null);
+      setError(""); // Crucial: Clear error message on success!
+
     } catch (e) {
-      console.error(e);
-      setError("发送失败：" + String(e));
-      setMessages((prev) => prev.filter((m) => !m._streaming));
-    } finally {
-      setStreaming(false);
-      setSending(false);
-      inputRef.current?.focus();
+      console.error("发送消息失败:", e);
+      let errorDetail = String(e);
+      let parsedError = null;
+      let is409Error = false;
       try {
-        setSessions(await api.getSessions()); // 刷新会话列表（带出最新 title/时间）
-      } catch {}
+          // 尝试解析错误消息，如果它看起来像我们 API 辅助函数抛出的 JSON 字符串
+          // 注意：e.message 可能会包含 "Error: " 前缀
+          const rawErrorMessage = errorDetail.startsWith('Error: ') ? errorDetail.substring(7) : errorDetail;
+          if (rawErrorMessage.startsWith('{') && rawErrorMessage.endsWith('}')) {
+            parsedError = JSON.parse(rawErrorMessage);
+            if (parsedError && parsedError.status === 409 && parsedError.detail) {
+                errorDetail = parsedError.detail;
+                is409Error = true;
+            }
+          }
+      } catch (parseError) {
+          // 如果解析失败，说明不是我们期望的 JSON 格式错误，按普通字符串处理
+          console.warn("Error parsing error message:", parseError);
+      }
+
+
+      if (is409Error) {
+        const nextRetryAttempt = retryAttempt + 1;
+        setRetryAttempt(nextRetryAttempt);
+        setIsSessionLocked(true); // Indicate session is locked, and we're waiting/retrying
+
+        if (nextRetryAttempt <= MAX_RETRY_ATTEMPTS) {
+          const delay = BASE_RETRY_DELAY_MS * (2 ** (nextRetryAttempt - 1));
+          setError(`会话忙，将在 ${delay / 1000} 秒后自动重试... (第 ${nextRetryAttempt}/${MAX_RETRY_ATTEMPTS} 次)`);
+          const timeout = setTimeout(() => sendMessage(textToSend, true), delay);
+          setRetryTimeoutId(timeout);
+        } else {
+          // Max retries reached
+          setError(`会话长时间忙碌，已停止重试。错误: ${errorDetail}。请稍后手动重试。`);
+          // Remove the optimistic user message if max retries reached and failed
+          setMessages((prev) => {
+              let copy = [...prev];
+              if (currentUserMessageIndex !== -1 && copy[currentUserMessageIndex] && copy[currentUserMessageIndex]._optimistic) {
+                  copy.splice(currentUserMessageIndex, 1);
+              }
+              // Ensure any stray assistant placeholders are also removed (though with new logic, they shouldn't exist for 409)
+              if (assistantMessageIndex !== -1 && copy[assistantMessageIndex] && copy[assistantMessageIndex]._streaming) {
+                  copy.splice(assistantMessageIndex, 1); // remove if it was added for some reason
+              }
+              return copy;
+          });
+          setIsSessionLocked(false); // No longer actively retrying for this message
+        }
+      } else {
+        // Handle other types of errors (e.g., network, LLM upstream, or API parsing error)
+        setError("发送失败：" + errorDetail);
+        // Remove optimistic messages in case of other errors
+        setMessages((prev) => {
+            let copy = [...prev];
+            if (currentUserMessageIndex !== -1 && copy[currentUserMessageIndex] && copy[currentUserMessageIndex]._optimistic) {
+                copy.splice(currentUserMessageIndex, 1);
+            }
+            if (assistantMessageIndex !== -1 && copy[assistantMessageIndex] && copy[assistantMessageIndex]._streaming) {
+                copy.splice(assistantMessageIndex, 1);
+            }
+            return copy;
+        });
+        setIsSessionLocked(false); // Not locked, just failed
+      }
+    } finally {
+      // Only reset sending/streaming if not actively retrying OR max retries reached
+      // This ensures that if retries are pending, the UI remains disabled.
+      if (!isSessionLocked || retryAttempt >= MAX_RETRY_ATTEMPTS) {
+        setStreaming(false); // Only set streaming to false if we are not actively streaming or finished all retries
+        setSending(false); // Only set sending to false if we are not actively sending or finished all retries
+        inputRef.current?.focus();
+        // Refresh sessions list only on final success or final failure
+        try {
+          setSessions(await api.getSessions());
+        } catch {}
+      }
     }
   }
 
   function onKeyDown(e) {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      sendMessage();
+      const messageText = input.trim();
+      sendMessage(messageText);
     }
   }
 
@@ -506,6 +649,12 @@ export default function App() {
           setMessages([]);
           setCurrentCharId(null);
         }
+        setError(""); // Clear error when deleting active session
+        // Reset retry states
+        setIsSessionLocked(false);
+        setRetryAttempt(0);
+        if (retryTimeoutId) clearTimeout(retryTimeoutId);
+        setRetryTimeoutId(null);
       }
     } catch (err) {
       setError("删除失败：" + String(err));
@@ -546,7 +695,7 @@ export default function App() {
     };
     rec.onend = () => {
       setRecOn(false);
-      if (finalTxt.trim()) sendMessage();
+      if (finalTxt.trim()) sendMessage(finalTxt.trim()); // Use finalTxt for ASR input
     };
     try {
       rec.start();
@@ -558,6 +707,9 @@ export default function App() {
   }
 
   /* ---------------- UI ---------------- */
+  // isDisabled now considers the session being locked and retrying
+  const isDisabled = sending || streaming || (isSessionLocked && retryAttempt < MAX_RETRY_ATTEMPTS);
+
   return (
     <div
       className="grid h-screen w-screen bg-slate-50 text-slate-900"
@@ -801,7 +953,7 @@ export default function App() {
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={onKeyDown}
-              disabled={sending || streaming}
+              disabled={isDisabled}
             />
             <button
               onClick={recOn ? stopASR : startASR}
@@ -812,15 +964,16 @@ export default function App() {
                   : "bg-white border-slate-200"
               )}
               title="语音输入"
+              disabled={isDisabled}
             >
               {recOn ? "停止" : "🎤 语音"}
             </button>
             <button
-              onClick={sendMessage}
-              disabled={sending || streaming || !input.trim()}
+              onClick={() => sendMessage()}
+              disabled={isDisabled || !input.trim()}
               className={clsx(
                 "px-4 py-2 rounded-md text-white",
-                sending || streaming || !input.trim()
+                isDisabled || !input.trim()
                   ? "bg-slate-400"
                   : "bg-slate-900 hover:bg-black"
               )}
@@ -841,3 +994,4 @@ export default function App() {
     </div>
   );
 }
+// --- END OF FILE App.jsx ---
