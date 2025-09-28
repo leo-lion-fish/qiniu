@@ -102,6 +102,7 @@ export default function App() {
   );
   const [autoSpeak, setAutoSpeak] = useLocalStorage("cfg.autoSpeak", true);
   const audioRef = useRef(null);
+  // const [isPlayingAudio, setIsPlayingAudio] = useState(false); // REMOVED
 
   /* ---------- ASR (Web Speech API) ---------- */
   const [recOn, setRecOn] = useState(false);
@@ -110,6 +111,7 @@ export default function App() {
   /* ---------- Refs ---------- */
   const listBottomRef = useRef(null);
   const inputRef = useRef(null);
+  // const currentAbortController = useRef(null); // REMOVED
   const [showSettings, setShowSettings] = useState(false); // 左侧底部折叠
 
   /* ---------- API helpers ---------- */
@@ -179,11 +181,12 @@ export default function App() {
         if (!r.ok) throw new Error(await r.text());
         return r.json();
       },
-      async *chatStream(body) {
+      async *chatStream(body) { // Removed signal parameter
         const r = await fetch(`${baseUrl}/chat/stream`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
+          // Removed signal: signal,
         });
         // --- Custom error handling for 409 ---
         if (r.status === 409) {
@@ -403,21 +406,53 @@ export default function App() {
 
   async function speakIfNeeded(text) {
     if (!autoSpeak || !text) return;
+    if (!audioRef.current) return;
+
     try {
+      // audioRef.current.onended = () => setIsPlayingAudio(false); // REMOVED
+      // audioRef.current.onplay = () => setIsPlayingAudio(true); // REMOVED
+      // audioRef.current.onpause = () => setIsPlayingAudio(false); // REMOVED
+
       const { audio } = await api.tts(voiceType, text, "mp3", 1.0);
-      if (audioRef.current) {
-        audioRef.current.src = audio;
-        await audioRef.current.play().catch(() => {});
-      }
+      audioRef.current.src = audio;
+      await audioRef.current.play().catch((err) => {
+        console.warn("TTS 播放失败 (可能需要用户交互)：", err);
+        // setIsPlayingAudio(false); // REMOVED
+      });
     } catch (e) {
-      console.warn("TTS 播放失败：", e);
+      console.warn("TTS 播放请求失败：", e);
+      // setIsPlayingAudio(false); // REMOVED
     }
   }
+
+  // function stopSpeaking() { // REMOVED
+  //   if (audioRef.current && isPlayingAudio) {
+  //     audioRef.current.pause();
+  //     audioRef.current.currentTime = 0;
+  //     setIsPlayingAudio(false);
+  //   }
+  // }
+
+  // function stopGenerating() { // REMOVED
+  //   if (currentAbortController.current) {
+  //     currentAbortController.current.abort();
+  //     currentAbortController.current = null;
+  //     setStreaming(false);
+  //     setError("生成已停止。");
+  //   }
+  // }
+
 
   // Refactored sendMessage to handle retries gracefully
   async function sendMessage(originalInputText = null, isRetry = false) {
     const textToSend = originalInputText !== null ? originalInputText : input.trim();
     if (!textToSend || sending || streaming) return;
+
+    // Clear any previous abort controller if it somehow wasn't cleared (safety) // REMOVED
+    // if (currentAbortController.current) {
+    //   currentAbortController.current.abort();
+    //   currentAbortController.current = null;
+    // }
 
     // On the very first attempt for a new user message, reset all retry-related states
     if (!isRetry) {
@@ -456,6 +491,10 @@ export default function App() {
         return prev;
     });
 
+    // Create a new AbortController for *this* send attempt // REMOVED
+    // const abortController = new AbortController();
+    // currentAbortController.current = abortController; // Store it in ref
+
     try {
       const body = { session_id: sid, message: textToSend };
       if (finalModel) body.model = finalModel;
@@ -465,7 +504,7 @@ export default function App() {
       let assistantMessageIndex = -1; // Index for the assistant's reply (placeholder or full)
 
       // Use the api.chatStream generator directly.
-      // If it throws a 409 error, it will be caught below, and assistant placeholder won't be added.
+      // Pass the signal from the abortController. // Removed signal parameter
       const chatStreamGenerator = api.chatStream(body);
 
       try {
@@ -500,13 +539,9 @@ export default function App() {
         }
       } catch (streamError) {
           // Pass stream errors to outer catch block for 409 or other API errors.
+          // The outer catch block will distinguish 409, AbortError, etc.
           throw streamError;
       }
-
-      // If no chunks were received but no error, it might be an empty reply or non-streaming reply scenario.
-      // In this specific design, we expect either chunks or an error from chatStream.
-      // If chatStream successfully completes but yields nothing, acc will be empty, which is valid for an empty response.
-      // No explicit non-streaming fallback needed here if api.chatStream is the primary interaction.
 
       // Mark streaming complete and remove optimistic/streaming flags
       setMessages((prev) =>
@@ -536,21 +571,27 @@ export default function App() {
       let errorDetail = String(e);
       let parsedError = null;
       let is409Error = false;
-      try {
-          // 尝试解析错误消息，如果它看起来像我们 API 辅助函数抛出的 JSON 字符串
-          // 注意：e.message 可能会包含 "Error: " 前缀
+      // let isAbortError = false; // REMOVED
+
+      // Check for AbortError first, as it's a specific type of user-triggered error // REMOVED
+      // if (e.name === 'AbortError') {
+      //     isAbortError = true;
+      //     errorDetail = "生成已停止。"; // Use a more specific message for user abort
+      // } else {
+          // Try to parse the error message if it looks like JSON from our API helper
           const rawErrorMessage = errorDetail.startsWith('Error: ') ? errorDetail.substring(7) : errorDetail;
           if (rawErrorMessage.startsWith('{') && rawErrorMessage.endsWith('}')) {
-            parsedError = JSON.parse(rawErrorMessage);
-            if (parsedError && parsedError.status === 409 && parsedError.detail) {
-                errorDetail = parsedError.detail;
-                is409Error = true;
+            try {
+                parsedError = JSON.parse(rawErrorMessage);
+                if (parsedError && parsedError.status === 409 && parsedError.detail) {
+                    errorDetail = parsedError.detail;
+                    is409Error = true;
+                }
+            } catch (parseError) {
+                console.warn("Error parsing error message:", parseError);
             }
           }
-      } catch (parseError) {
-          // 如果解析失败，说明不是我们期望的 JSON 格式错误，按普通字符串处理
-          console.warn("Error parsing error message:", parseError);
-      }
+      // } // REMOVED
 
 
       if (is409Error) {
@@ -572,7 +613,7 @@ export default function App() {
               if (currentUserMessageIndex !== -1 && copy[currentUserMessageIndex] && copy[currentUserMessageIndex]._optimistic) {
                   copy.splice(currentUserMessageIndex, 1);
               }
-              // Ensure any stray assistant placeholders are also removed (though with new logic, they shouldn't exist for 409)
+              // Remove assistant placeholder if it was added for any reason (though with new logic, they shouldn't exist for 409)
               if (assistantMessageIndex !== -1 && copy[assistantMessageIndex] && copy[assistantMessageIndex]._streaming) {
                   copy.splice(assistantMessageIndex, 1); // remove if it was added for some reason
               }
@@ -581,7 +622,7 @@ export default function App() {
           setIsSessionLocked(false); // No longer actively retrying for this message
         }
       } else {
-        // Handle other types of errors (e.g., network, LLM upstream, or API parsing error)
+        // Handle other types of errors (e.g., network, LLM upstream, or general API parsing error)
         setError("发送失败：" + errorDetail);
         // Remove optimistic messages in case of other errors
         setMessages((prev) => {
@@ -597,16 +638,22 @@ export default function App() {
         setIsSessionLocked(false); // Not locked, just failed
       }
     } finally {
-      // Only reset sending/streaming if not actively retrying OR max retries reached
-      // This ensures that if retries are pending, the UI remains disabled.
-      if (!isSessionLocked || retryAttempt >= MAX_RETRY_ATTEMPTS) {
-        setStreaming(false); // Only set streaming to false if we are not actively streaming or finished all retries
-        setSending(false); // Only set sending to false if we are not actively sending or finished all retries
+      // Always clear the AbortController ref. // REMOVED
+      // currentAbortController.current = null; // REMOVED
+
+      // ALWAYS reset sending/streaming flags if no longer explicitly locked and retrying
+      // This ensures UI is responsive after any error or success.
+      if (!isSessionLocked || retryAttempt >= MAX_RETRY_ATTEMPTS || !is409Error) { // Added !is409Error to ensure clearing if not 409
+        setSending(false);
+        setStreaming(false);
         inputRef.current?.focus();
-        // Refresh sessions list only on final success or final failure
-        try {
-          setSessions(await api.getSessions());
-        } catch {}
+      }
+
+      // Always try to refresh sessions, as it's just fetching data.
+      try {
+        setSessions(await api.getSessions());
+      } catch (err) {
+        console.error("Failed to refresh sessions:", err); // Log this, but don't stop the main flow
       }
     }
   }
@@ -709,6 +756,7 @@ export default function App() {
   /* ---------------- UI ---------------- */
   // isDisabled now considers the session being locked and retrying
   const isDisabled = sending || streaming || (isSessionLocked && retryAttempt < MAX_RETRY_ATTEMPTS);
+  // const showStopButton = streaming || isPlayingAudio; // REMOVED
 
   return (
     <div
@@ -968,6 +1016,23 @@ export default function App() {
             >
               {recOn ? "停止" : "🎤 语音"}
             </button>
+
+            {/* REMOVED: Stop button for generation or speaking */}
+            {/* {showStopButton && (
+              <button
+                onClick={streaming ? stopGenerating : stopSpeaking}
+                className={clsx(
+                  "px-3 py-2 rounded-md border",
+                  streaming
+                    ? "bg-orange-100 border-orange-300 text-orange-700"
+                    : "bg-blue-100 border-blue-300 text-blue-700"
+                )}
+                title={streaming ? "停止生成" : "停止朗读"}
+              >
+                {streaming ? "⏹️ 停止生成" : "🔇 停止朗读"}
+              </button>
+            )} */}
+
             <button
               onClick={() => sendMessage()}
               disabled={isDisabled || !input.trim()}
