@@ -300,7 +300,7 @@ Redis 被用于存储会话历史和会话锁，原因如下：
 ---
 
 ### **3. 系统框架图**
-
+```mermaid
 graph TD
     subgraph "User Interface (React/Vite Frontend)"
         A[用户浏览器] --> B(App.jsx)
